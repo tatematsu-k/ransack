@@ -456,6 +456,49 @@ module Ransack
       let(:notable_type_field) {
         "#{quote_table_name("notes")}.#{quote_column_name("notable_type")}"
       }
+      let(:people_temperament_field) {
+        "#{quote_table_name("people")}.#{quote_column_name("temperament")}"
+      }
+
+      context 'when evaluating enums' do
+        before do
+          Person.first.update_attribute(:temperament, 'choleric')
+        end
+
+        it 'evaluates enum key correctly' do
+          s = Search.new(Person, temperament_eq: 'choleric')
+
+          expect(s.result.to_sql).not_to match(/#{people_temperament_field} = 0/)
+          expect(s.result.to_sql).to match(/#{people_temperament_field} = #{Person.temperaments[:choleric]}/)
+          expect(s.result).not_to be_empty
+        end
+
+        it 'evaluates enum value correctly' do
+          s = Search.new(Person, temperament_eq: Person.temperaments[:choleric])
+
+          expect(s.result.to_sql).not_to match(/#{people_temperament_field} = 0/)
+          expect(s.result.to_sql).to match(/#{people_temperament_field} = #{Person.temperaments[:choleric]}/)
+          expect(s.result).not_to be_empty
+        end
+      end
+
+      # Regression test for https://github.com/activerecord-hackery/ransack/issues/1644
+      context 'when enum fix does not break boolean predicate casting' do
+        it 'casts 0 to false for not_null predicate' do
+          s = Search.new(Person, name_not_null: 0)
+          expect(s.result.to_sql).to match(/#{people_name_field} IS NULL/)
+        end
+
+        it 'casts 1 to true for not_null predicate' do
+          s = Search.new(Person, name_not_null: 1)
+          expect(s.result.to_sql).to match(/#{people_name_field} IS NOT NULL/)
+        end
+
+        it 'casts "false" to false for not_null predicate' do
+          s = Search.new(Person, name_not_null: 'false')
+          expect(s.result.to_sql).to match(/#{people_name_field} IS NULL/)
+        end
+      end
 
       it 'evaluates conditions contextually' do
         s = Search.new(Person, children_name_eq: 'Ernie')
@@ -476,8 +519,9 @@ module Ransack
 
         expect(real_query)
                 .to match(%r{LEFT OUTER JOIN articles ON (\('default_scope' = 'default_scope'\) AND )?articles.person_id = people.id})
+        # Rails 8.1+ / Arel 10+ use "AS" for join table aliases (e.g. "articles AS articles_people")
         expect(real_query)
-                .to match(%r{LEFT OUTER JOIN articles articles_people ON (\('default_scope' = 'default_scope'\) AND )?articles_people.person_id = parents_people.id})
+                .to match(%r{LEFT OUTER JOIN articles(\s+AS)?\s+articles_people ON (\('default_scope' = 'default_scope'\) AND )?articles_people.person_id = parents_people.id})
 
         expect(real_query)
           .to include "people.name = 'person_name_query'"
@@ -507,7 +551,9 @@ module Ransack
           WHERE (people.name = 'Ernie' AND parents_people.name = 'Test')
         SQL
         .squish
-        expect(real_query).to eq expected_query
+        # Normalize JOIN alias format: Rails 8.1+ / Arel 10+ output "AS" (e.g. "people AS parents_people")
+        normalize_join_aliases = ->(sql) { sql.gsub(/\s+AS\s+/, ' ') }
+        expect(normalize_join_aliases.call(real_query)).to eq normalize_join_aliases.call(expected_query)
       end
 
       it 'evaluates compound conditions contextually' do
@@ -727,6 +773,23 @@ module Ransack
       it 'overrides existing sort' do
         @s.sorts = 'id asc'
         expect(@s.result.first.id).to eq 1
+      end
+
+      it 'creates valid sort when ransortable_attributes returns symbols (issue #1538)' do
+        Person.singleton_class.class_eval do
+          define_method(:ransortable_attributes) { |_auth = nil| [:id, :name] }
+        end
+        begin
+          @s.sorts = 'name asc'
+          expect(@s.sorts.size).to eq(1)
+          sort = @s.sorts.first
+          expect(sort).to be_a Nodes::Sort
+          expect(sort).to be_valid
+          expect(@s.result.to_sql).to include('ORDER BY')
+          expect(@s.result.to_sql).to include('name')
+        ensure
+          Person.singleton_class.remove_method(:ransortable_attributes)
+        end
       end
 
       it 'raises ArgumentError when an invalid argument is sent' do
